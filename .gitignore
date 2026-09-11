@@ -1,20 +1,11 @@
-# Dữ liệu ảnh và dataset nặng
 dataset/images/
 dataset/*.JPEG
 dataset/*.jpg
 dataset/*.png
-
-# Thư mục output chứa adversarial images
 Attack/outputs/
-
-# Checkpoints mô hình đã tải
 models/
 *.pth
 *.pt
 *.ckpt
-
-# Cache của Python và hệ thống
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
-.DS_Store
