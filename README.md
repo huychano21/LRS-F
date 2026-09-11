@@ -1,141 +1,25 @@
-# LRS-Attack
+# LRS-F: Exploring Low-Rank, Sparsity, and Frequency in Adversarial Attacks
 
-[[Paper](https://icml.cc/virtual/2026/poster/65377)] [[Supp](https://icml.cc/virtual/2026/poster/65377)] [[Poster](https://icml.cc/virtual/2026/poster/65377)] [[Video](https://icml.cc/virtual/2026/poster/65377)]
+Nghiên cứu mở rộng phương pháp LRS-Attack bằng cách tích hợp biến đổi miền tần số (2D-DCT) phân cấp theo độ sâu mạng.
 
-The official implementation of [**\[ICML 2026\] "Low-Rank and Sparsity Are All You Need: Exploring Robust Hierarchical Latent Subspaces for Transferable Adversarial Attack", Shuangshuang Pu, Wen Yang, Min Li, Guodong Liu, Chris Ding, Di Ming*.**](https://icml.cc/virtual/2026/poster/65377)
+## Cấu trúc thư mục chính
+- `function/LRS.py`: Cài đặt hàm `multi_lrsf_inv3` kết hợp Low-Rank, Sparse và Depth-aware Frequency.
+- `function/dct.py`: Biến đổi 2D-DCT, IDCT và trích xuất mặt nạ tần số (LF, MF, HF).
+- `Attack/CNN/Inc-v3/MI-LRSF.py`: Kịch bản tấn công chính MI + LRS-F (hỗ trợ tinh chỉnh `--frequency_weight`).
+- `Attack/CNN/Inc-v3/Frequency-MI-FGSM.py`: Tấn công độc lập chỉ dùng miền tần số.
+- `Attack/CNN/Inc-v3/step9A_mechanistic_validation.py`: Kiểm chứng cơ chế toán học và khôi phục DCT.
+- `Attack/CNN/Inc-v3/step9B_expert_gradient_validation.py`: Kiểm tra tính phân biệt gradient giữa các expert.
+- `Attack/CNN/Inc-v3/step9C_optimization_dynamics_validation.py`: Theo dõi động lực học tối ưu (Loss, Grad L2) qua 10 vòng lặp.
+- `Attack/CNN/Inc-v3/step11_perceptual_statistics.py`: Đo đạc chất lượng ảnh adversarial (SSIM, PSNR, L2, Linf).
+- `verify_cnns.py`: Đo lường ASR trên 12 mô hình Black-box.
 
-## Introduction
+## Hướng dẫn chạy thử nghiệm
 
-Adversarial examples pose serious threats to deep neural networks, exposing fundamental vulnerabilities in model robustness. However, most existing adversarial attacks directly manipulate dense and redundant feature representations, often leading to overfitting on surrogate models and poor black-box transferability. Recent SVD-based attack attempts to exploit low-rank feature subspaces, yet its reliance on single-layer optimization and single-gradient pathway neglects structural redundancy in feature representations and hierarchical heterogeneity across layers. To address these limitations, we propose LRS-Attack, a low-rank and sparse decomposition attack that explicitly models robust hierarchical subspaces in latent feature spaces. Specifically, the low-rank component captures dominant semantic directions, while the sparse component captures localized and discriminative patterns. To efficiently extract low-rank structure while preserving subspace fidelity, we develop a warm-started alternating low-rank approximation algorithm. Moreover, we introduce a hierarchical mixture of robust experts that leverages depth-dependent feature characteristics and guides gradient optimization toward more transferable adversarial directions. Extensive experiments on ImageNet show that LRS-Attack consistently improves black-box transferability over state-of-the-art methods across diverse CNN/ViT architectures and defense settings.
+1. Tấn công MI + LRS-F:
+   python Attack/CNN/Inc-v3/MI-LRSF.py --input_csv dataset/images.csv --input_dir dataset/images --output_dir Attack/outputs/incv3-LRSF-weight-0.05 --frequency_weight 0.05
 
-![Home](https://github.com/AdvML-Group/LRS-Attack/blob/main/show_image/framework.png)
+2. Đánh giá ASR:
+   python verify_cnns.py --adv_dir Attack/outputs/incv3-LRSF-weight-0.05 --input_csv dataset/images.csv --input_dir dataset/images
 
-## Key Features
-
-- **Plug-and-Play Framework**
-  LRS-Attack can be seamlessly integrated into a wide range of existing gradient-based adversarial attacks without modifying their overall optimization pipeline.
-
-- **Model-Agnostic**
-  Applicable to both CNN-based and Vision Transformer (ViT)-based surrogate attacks.
-
-- **Low-Rank + Sparse Feature Modeling**
-  Instead of directly optimizing redundant feature representations, LRS-Attack decomposes latent features into low-rank semantic structures and sparse discriminative components to improve transferable perturbation learning.
-
-- **Hierarchical Robust Experts**
-  Different network layers exhibit distinct transfer characteristics. LRS-Attack employs hierarchical experts to adaptively optimize feature representations across layers.
-
-- **Easy Integration**
-  Only a few additional modules are required to enhance existing attacks while keeping their original optimization strategy unchanged.
-
-# Getting Start
-
-## Dependencies
-- Python 3.9.12
-- torch 2.8.0
-- pretrainedmodels 0.7.4
-- numpy 1.26.4
-- pandas 2.3.2
-
-## Usage Instructions
-LRS-Attack extends existing attack methods rather than replacing them.
-Each attack script below corresponds to the original baseline equipped with our proposed LRS-Attack.
-
-- Prepare models
-
-  1. Download pretrained [CNN](https://github.com/ylhz/tf_to_pytorch_model) and [Vision Transformer](https://github.com/ylhz/tf_to_pytorch_model) models. Then put these models into `./models/` before running the code.
-
-  2. We conduct experiments on the ImageNet-compatible dataset, comprising 1000 images, used in the NIPS 2017 adversarial competition. The image path is `./dataset/images`.
-
-- Run LRS-Enhanced Attacks
-
-1. CNN-based Baselines
-
-LRS-Attack can be integrated into various CNN-based transferable attacks.
-
-  ```bash  
-  # Implement MI-FGSM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python MI-FGSM.py
-  # Implement DI-FGSM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python DI-FGSM.py
-  # Implement TI-FGSM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python TI-FGSM.py
-  # Implement PI-FGSM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python PI-FGSM.py
-  # Implement GI-FGSM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python GI-FGSM.py
-  # Implement SI-NI-FGSM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python SI-NI-FGSM.py
-  # Implement VMI-FGSM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python VMI-FGSM.py
-  ```
-  where `gpuid` can be set to any free GPU ID in your machine. The adversarial examples generated by each attack will be saved in the corresponding directory under `./outputs/`.
-
-2. ViT-based Baselines
-
-LRS-Attack can also be integrated into various Vision Transformer (ViT)-based transferable attacks.
-  ```bash
-  # Implement MIM + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python MIM.py
-  # Implement PNA + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python PNA.py
-  # Implement TGR + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python TGR.py
-  # Implement ATT + LRS-Attack
-  CUDA_VISIBLE_DEVICES=gpuid python ATT.py
-  ```
-  The adversarial examples generated by each ViT attack will be saved in the corresponding directory under `./outputs_vit/`.
-
-- Evaluation on CNN Models
-
-  Run `verify_cnns.py` to evaluate the attack success rate.
-
-  ```bash
-  python verify_cnns.py
-  ```
-
-- Evaluation on Vision Transformer models
-
-  Run `verify_vits.py` to evaluate the attack success rate.
-
-  ```bash
-  python verify_vits.py
-  ```
-
-- Evaluations on defenses
-
-  To evaluate the attack success rates on defense models, we test eight defense models which contain four adversarial trained models (Inc-v3adv, Inc-v3ens3, Inc-v3ens4, IncRes-v2ens) and four more advanced models (HGD, JPEG, R&P, NIPS-r3).
-
-  - [Inc-v3adv, Inc-v3ens3, Inc-v3ens4, IncRes-v2ens](https://github.com/ylhz/tf_to_pytorch_model):You can directly run `verify_cnns.py` to test these models.
-
-  - [HGD](https://github.com/lfz/Guided-Denoise),[R&P](https://github.com/cihangxie/NIPS2017_adv_challenge_defense),[NIPS-r3](https://github.com/anlthms/nips-2017/tree/master/mmd):We directly run the code from the corresponding official repo.
-
-  - [JPEG](https://github.com/JHL-HUST/VT/blob/main/third_party/jpeg.py):Refer to [here](https://github.com/JHL-HUST/VT/blob/main/third_party/jpeg.py).
-
-
-## Acknowledgments
-
- Code refers to [SVD](https://github.com/WJJLL/SVD-SSA).
-
- We thanks the authors for sharing sincerely.
-
-## Citation
-
- If you find this work is useful in your research, please cite our paper:
-
-```
-@InProceedings{ICML26_LRS_Attack,
-    author    = {Pu, Shuangshuang and Yang, Wen and Li, Min and Liu, Guodong and Ding, Chris and Ming, Di},
-    title     = {Low-Rank and Sparsity Are All You Need: Exploring Robust Hierarchical Latent Subspaces for Transferable Adversarial Attack},
-    booktitle = {Forty-third International Conference on Machine Learning (ICML 2026)},
-    month     = {July},
-    year      = {2026},
-    pages     = {}
-}
-
-```
-
-## Contact
-
-[Shuangshuang Pu](https://github.com/ShuangPu/shuangpu): [shuangshuangpu@stu.cqut.edu.cn](mailto:shuangshuangpu@stu.cqut.edu.cn)
-
-[Di Ming (*Corresponding Author)](https://midasdming.github.io/): [diming@cqut.edu.cn](mailto:diming@cqut.edu.cn)
+3. Đánh giá chất lượng thị giác (SSIM/PSNR):
+   python Attack/CNN/Inc-v3/step11_perceptual_statistics.py --clean_dir dataset/images --lrs_dir Attack/outputs/incv3-MI-FGSM-lrs --lrsf_dir Attack/outputs/incv3-LRSF-weight-0.05

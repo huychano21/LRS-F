@@ -12,6 +12,13 @@ import torchvision.models as models
 from function.Normalize import Normalize, TfNormalize
 from function.loader import ImageNet
 
+#Huychan: import ssl để bỏ qua lỗi SSL khi tải các mô hình từ internet (trong trường hợp không có chứng chỉ SSL hợp lệ)
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+#huychan: import warnings để bỏ qua các cảnh báo khi tải các mô hình từ internet (trong trường hợp không có chứng chỉ SSL hợp lệ)
+import warnings
+warnings.filterwarnings("ignore")
+
 batch_size = 10
 input_csv = './dataset/images.csv'
 input_dir = 'dataset/images'
