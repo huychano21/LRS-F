@@ -160,7 +160,16 @@ def multi_lrs_inv3(model, input, num_iters,
 # LRS-F: Low-Rank + Sparse + Depth-aware Frequency
 # ============================================================
 
-def multi_lrsf_inv3(
+
+# def multi_lrsf_inv3(
+# tÊN GỐC BAN ĐẦU
+
+
+# ============================================================
+# LRS-F: Proposed Feature-Level Frequency Fusion
+# ============================================================
+
+def multi_lrsf_featurefusion_inv3(
     model,
     input,
     num_iters=5,
@@ -171,495 +180,180 @@ def multi_lrsf_inv3(
     compression_rate_deep=0.0,
     rank_ratio_deep=0.1,
     lf_threshold=0.20,
-    mf_threshold=0.50
+    mf_threshold=0.50,
+    gamma_shallow=1.0,
+    gamma_middle=1.0,
+    gamma_deep=1.0,
+    frequency_schedule="lrsf" # Thêm param này để tránh lỗi kwarg nếu file chạy gọi đến
 ):
-    """
-    LRS-F for Inception-v3.
-
-    Depth-aware combination:
-
-        shallow  = Sparse + High Frequency
-        middle   = Low-rank + Sparse + Mid Frequency
-        deep     = Low-rank + Low Frequency
-
-    Original branch is kept unchanged.
-
-    Frequency representation is parallel to LRS decomposition.
-    It is NOT treated as a third residual component in L + S + F.
-
-    Frequency partition:
-        LF: r <= 0.20
-        MF: 0.20 < r <= 0.50
-        HF: r > 0.50
-    """
-
-    # --------------------------------------------------------
-    # Frequency helper
-    # --------------------------------------------------------
-
     def keep_frequency(feature, band):
-        """
-        DCT -> radial frequency mask -> IDCT.
-
-        feature:
-            [B, C, H, W]
-        """
-
         B, C, H, W = feature.size()
-
         coeff = dct_2d(feature)
-
-        # Normalized radial frequency coordinate.
-        #
-        # DC / lowest frequency is located near (0, 0).
         yy, xx = torch.meshgrid(
-            torch.arange(
-                H,
-                device=feature.device,
-                dtype=feature.dtype
-            ),
-            torch.arange(
-                W,
-                device=feature.device,
-                dtype=feature.dtype
-            ),
+            torch.arange(H, device=feature.device, dtype=feature.dtype),
+            torch.arange(W, device=feature.device, dtype=feature.dtype),
             indexing="ij"
         )
+        if H > 1: yy = yy / (H - 1)
+        if W > 1: xx = xx / (W - 1)
+        radius = torch.sqrt(yy ** 2 + xx ** 2) / (2.0 ** 0.5)
 
-        if H > 1:
-            yy = yy / (H - 1)
+        if band == "LF": mask = radius <= lf_threshold
+        elif band == "MF": mask = (radius > lf_threshold) & (radius <= mf_threshold)
+        elif band == "HF": mask = radius > mf_threshold
+        else: raise ValueError(f"Unknown frequency band: {band}")
 
-        if W > 1:
-            xx = xx / (W - 1)
-
-        radius = torch.sqrt(
-            yy ** 2 + xx ** 2
-        ) / (2.0 ** 0.5)
-
-        if band == "LF":
-            mask = radius <= lf_threshold
-
-        elif band == "MF":
-            mask = (
-                (radius > lf_threshold) &
-                (radius <= mf_threshold)
-            )
-
-        elif band == "HF":
-            mask = radius > mf_threshold
-
-        else:
-            raise ValueError(
-                "Unknown frequency band: {}".format(band)
-            )
-
-        mask = mask.to(dtype=coeff.dtype)
-        mask = mask.view(1, 1, H, W)
-
+        mask = mask.to(dtype=coeff.dtype).view(1, 1, H, W)
         filtered_coeff = coeff * mask
-
-        filtered_feature = idct_2d(
-            filtered_coeff
-        )
-
-        return filtered_feature
+        return idct_2d(filtered_coeff)
 
     # ========================================================
     # SHALLOW
-    #
-    # LRS:
-    #     Sparse
-    #
-    # LRS-F:
-    #     Sparse + High Frequency
-    #
-    # Feature location:
-    #     Mixed_5b -> [B, 256, 35, 35]
     # ========================================================
-
     x_sparse = model.Conv2d_1a_3x3(input)
     x_sparse = model.Conv2d_2a_3x3(x_sparse)
     x_sparse = model.Conv2d_2b_3x3(x_sparse)
-    x_sparse = F.max_pool2d(
-        x_sparse,
-        kernel_size=3,
-        stride=2
-    )
+    x_sparse = F.max_pool2d(x_sparse, kernel_size=3, stride=2)
     x_sparse = model.Conv2d_3b_1x1(x_sparse)
     x_sparse = model.Conv2d_4a_3x3(x_sparse)
-    x_sparse = F.max_pool2d(
-        x_sparse,
-        kernel_size=3,
-        stride=2
-    )
+    x_sparse = F.max_pool2d(x_sparse, kernel_size=3, stride=2)
     x_sparse = model.Mixed_5b(x_sparse)
 
     B, C, H, W = x_sparse.size()
+    target_rank, num_nonzeros = calculate_lrs_parameters(C, H * W, compression_rate_shallow, rank_ratio_shallow)
+    feat_sparse = x_sparse.view(B, C, H * W).float()
+    D_sparse = torch.clamp(torch.sqrt(torch.sum(feat_sparse * feat_sparse, dim=-1, keepdim=True)), min=1e-8)
+    normalized_feat_sparse = feat_sparse / D_sparse
 
-    d_out = C
-    d_in = H * W
+    _, sparse_comp = altern_ls(normalized_feat_sparse, num_iters, target_rank, num_nonzeros=num_nonzeros)
 
-    target_rank, num_nonzeros = calculate_lrs_parameters(
-        d_out,
-        d_in,
-        compression_rate_shallow,
-        rank_ratio_shallow
-    )
+    # 1. Lấy tần số từ FEATURE ĐÃ CHUẨN HÓA (normalized feature)
+    normalized_spatial_sparse = normalized_feat_sparse.view(B, C, H, W)
+    freq_comp_s = keep_frequency(normalized_spatial_sparse, "HF")
 
-    feat_sparse = x_sparse.view(
-        B,
-        C,
-        H * W
-    ).float()
+    # 2. Cộng tần số vào Sparse component
+    R_s = sparse_comp.view(B, C, H, W) + gamma_shallow * freq_comp_s
 
-    D_sparse = torch.sqrt(
-        torch.sum(
-            feat_sparse * feat_sparse,
-            dim=-1,
-            keepdim=True
-        )
-    )
+    # 3. Rescale back SAU KHI đã cộng tần số
+    x_sparse_new = R_s * D_sparse.view(B, C, 1, 1)
 
-    D_sparse = torch.clamp(
-        D_sparse,
-        min=1e-8
-    )
 
-    normalized_feat_sparse = (
-        feat_sparse / D_sparse
-    )
+    # x_sparse_lrs = (sparse_comp * D_sparse).view(B, C, H, W)
+    # x_sparse_freq = keep_frequency(x_sparse, "HF")
+    # # LRS-F Shallow: Sparse + gamma_s * HF
+    # x_sparse_new = x_sparse_lrs + gamma_shallow * x_sparse_freq
 
-    # LRS sparse component
-    _, sparse_comp = altern_ls(
-        normalized_feat_sparse,
-        num_iters,
-        target_rank,
-        num_nonzeros=num_nonzeros
-    )
-
-    sparse_comp = (
-        sparse_comp * D_sparse
-    )
-
-    x_sparse_lrs = sparse_comp.view(
-        B,
-        C,
-        H,
-        W
-    )
-
-    # Frequency component from ORIGINAL feature
-    x_sparse_freq = keep_frequency(
-        x_sparse,
-        "HF"
-    )
-
-    # LRS-F shallow:
-    # Sparse + High Frequency
-    x_sparse_new = (
-        x_sparse_lrs +
-        x_sparse_freq
-    )
-
-    x_sparse_new = model.Mixed_5c(
-        x_sparse_new
-    )
-    x_sparse_new = model.Mixed_5d(
-        x_sparse_new
-    )
-    x_sparse_new = model.Mixed_6a(
-        x_sparse_new
-    )
-    x_sparse_new = model.Mixed_6b(
-        x_sparse_new
-    )
-    x_sparse_new = model.Mixed_6c(
-        x_sparse_new
-    )
-    x_sparse_new = model.Mixed_6d(
-        x_sparse_new
-    )
-    x_sparse_new = model.Mixed_6e(
-        x_sparse_new
-    )
-
-    logit_sparse = inv3_logit(
-        model,
-        x_sparse_new
-    )
+    x_sparse_new = model.Mixed_5c(x_sparse_new)
+    x_sparse_new = model.Mixed_5d(x_sparse_new)
+    x_sparse_new = model.Mixed_6a(x_sparse_new)
+    x_sparse_new = model.Mixed_6b(x_sparse_new)
+    x_sparse_new = model.Mixed_6c(x_sparse_new)
+    x_sparse_new = model.Mixed_6d(x_sparse_new)
+    x_sparse_new = model.Mixed_6e(x_sparse_new)
+    logit_sparse = inv3_logit(model, x_sparse_new)
 
     # ========================================================
     # MIDDLE
-    #
-    # LRS:
-    #     (Low-rank + Sparse) / 2
-    #
-    # LRS-F:
-    #     (Low-rank + Sparse) / 2 + Mid Frequency
-    #
-    # Feature location:
-    #     Mixed_5d -> [B, 288, 35, 35]
     # ========================================================
-
     x_balanced = model.Conv2d_1a_3x3(input)
     x_balanced = model.Conv2d_2a_3x3(x_balanced)
     x_balanced = model.Conv2d_2b_3x3(x_balanced)
-    x_balanced = F.max_pool2d(
-        x_balanced,
-        kernel_size=3,
-        stride=2
-    )
+    x_balanced = F.max_pool2d(x_balanced, kernel_size=3, stride=2)
     x_balanced = model.Conv2d_3b_1x1(x_balanced)
     x_balanced = model.Conv2d_4a_3x3(x_balanced)
-    x_balanced = F.max_pool2d(
-        x_balanced,
-        kernel_size=3,
-        stride=2
-    )
-    x_balanced = model.Mixed_5b(
-        x_balanced
-    )
-    x_balanced = model.Mixed_5c(
-        x_balanced
-    )
-    x_balanced = model.Mixed_5d(
-        x_balanced
-    )
+    x_balanced = F.max_pool2d(x_balanced, kernel_size=3, stride=2)
+    x_balanced = model.Mixed_5b(x_balanced)
+    x_balanced = model.Mixed_5c(x_balanced)
+    x_balanced = model.Mixed_5d(x_balanced)
 
     B, C, H, W = x_balanced.size()
+    target_rank, num_nonzeros = calculate_lrs_parameters(C, H * W, compression_rate_balanced, rank_ratio_balanced)
+    feat_balanced = x_balanced.view(B, C, H * W).float()
+    D_balanced = torch.clamp(torch.sqrt(torch.sum(feat_balanced * feat_balanced, dim=-1, keepdim=True)), min=1e-8)
+    normalized_feat_balanced = feat_balanced / D_balanced
 
-    d_out = C
-    d_in = H * W
+    low_rank_comp_balanced, sparse_comp_balanced = altern_ls(normalized_feat_balanced, num_iters, target_rank=target_rank, num_nonzeros=num_nonzeros)
 
-    target_rank, num_nonzeros = calculate_lrs_parameters(
-        d_out,
-        d_in,
-        compression_rate_balanced,
-        rank_ratio_balanced
-    )
+    # 1. Lấy tần số từ FEATURE ĐÃ CHUẨN HÓA
+    normalized_spatial_balanced = normalized_feat_balanced.view(B, C, H, W)
+    freq_comp_m = keep_frequency(normalized_spatial_balanced, "MF")
 
-    feat_balanced = x_balanced.view(
-        B,
-        C,
-        H * W
-    ).float()
+    R_m = (low_rank_comp_balanced + sparse_comp_balanced).view(B, C, H, W) + gamma_middle * freq_comp_m
 
-    D_balanced = torch.sqrt(
-        torch.sum(
-            feat_balanced * feat_balanced,
-            dim=-1,
-            keepdim=True
-        )
-    )
+    # 3. Rescale back SAU KHI đã cộng tần số
+    x_balanced_new = R_m * D_balanced.view(B, C, 1, 1)
 
-    D_balanced = torch.clamp(
-        D_balanced,
-        min=1e-8
-    )
 
-    normalized_feat_balanced = (
-        feat_balanced / D_balanced
-    )
+    #CODE TRƯỚC SỬA
+    # Không chia 2
+    #x_balanced_lrs = ((low_rank_comp_balanced + sparse_comp_balanced) * D_balanced).view(B, C, H, W)      #cô đề xuất
+     #Có chia 2
+    #x_balanced_lrs = ((low_rank_comp_balanced + sparse_comp_balanced) * D_balanced / 2.0).view(B, C, H, W) #code gốc
+    #x_balanced_freq = keep_frequency(x_balanced, "MF")
+    # LRS-F Middle: Lm + Sm + gamma_m * MF
+    #x_balanced_new = x_balanced_lrs + gamma_middle * x_balanced_freq
 
-    low_rank_comp_balanced, sparse_comp_balanced = altern_ls(
-        normalized_feat_balanced,
-        num_iters,
-        target_rank=target_rank,
-        num_nonzeros=num_nonzeros
-    )
-
-    # Same scale restoration as original LRS
-    decomp_balanced = (
-        low_rank_comp_balanced +
-        sparse_comp_balanced
-    ) * D_balanced / 2.0
-
-    x_balanced_lrs = decomp_balanced.view(
-        B,
-        C,
-        H,
-        W
-    )
-
-    # Frequency component from ORIGINAL middle feature
-    x_balanced_freq = keep_frequency(
-        x_balanced,
-        "MF"
-    )
-
-    # LRS-F middle:
-    # (L + S) / 2 + MF
-    x_balanced_new = (
-        x_balanced_lrs +
-        x_balanced_freq
-    )
-
-    x_balanced_new = model.Mixed_6a(
-        x_balanced_new
-    )
-    x_balanced_new = model.Mixed_6b(
-        x_balanced_new
-    )
-    x_balanced_new = model.Mixed_6c(
-        x_balanced_new
-    )
-    x_balanced_new = model.Mixed_6d(
-        x_balanced_new
-    )
-    x_balanced_new = model.Mixed_6e(
-        x_balanced_new
-    )
-
-    logit_balanced = inv3_logit(
-        model,
-        x_balanced_new
-    )
+    x_balanced_new = model.Mixed_6a(x_balanced_new)
+    x_balanced_new = model.Mixed_6b(x_balanced_new)
+    x_balanced_new = model.Mixed_6c(x_balanced_new)
+    x_balanced_new = model.Mixed_6d(x_balanced_new)
+    x_balanced_new = model.Mixed_6e(x_balanced_new)
+    logit_balanced = inv3_logit(model, x_balanced_new)
 
     # ========================================================
     # DEEP
-    #
-    # LRS:
-    #     Low-rank
-    #
-    # LRS-F:
-    #     Low-rank + Low Frequency
-    #
-    # Feature location:
-    #     Mixed_6e -> [B, 768, 17, 17]
     # ========================================================
-
     x_lowrank = model.Conv2d_1a_3x3(input)
     x_lowrank = model.Conv2d_2a_3x3(x_lowrank)
     x_lowrank = model.Conv2d_2b_3x3(x_lowrank)
-    x_lowrank = F.max_pool2d(
-        x_lowrank,
-        kernel_size=3,
-        stride=2
-    )
+    x_lowrank = F.max_pool2d(x_lowrank, kernel_size=3, stride=2)
     x_lowrank = model.Conv2d_3b_1x1(x_lowrank)
     x_lowrank = model.Conv2d_4a_3x3(x_lowrank)
-    x_lowrank = F.max_pool2d(
-        x_lowrank,
-        kernel_size=3,
-        stride=2
-    )
-    x_lowrank = model.Mixed_5b(
-        x_lowrank
-    )
-    x_lowrank = model.Mixed_5c(
-        x_lowrank
-    )
-    x_lowrank = model.Mixed_5d(
-        x_lowrank
-    )
-    x_lowrank = model.Mixed_6a(
-        x_lowrank
-    )
-    x_lowrank = model.Mixed_6b(
-        x_lowrank
-    )
-    x_lowrank = model.Mixed_6c(
-        x_lowrank
-    )
-    x_lowrank = model.Mixed_6d(
-        x_lowrank
-    )
-    x_lowrank = model.Mixed_6e(
-        x_lowrank
-    )
+    x_lowrank = F.max_pool2d(x_lowrank, kernel_size=3, stride=2)
+    x_lowrank = model.Mixed_5b(x_lowrank)
+    x_lowrank = model.Mixed_5c(x_lowrank)
+    x_lowrank = model.Mixed_5d(x_lowrank)
+    x_lowrank = model.Mixed_6a(x_lowrank)
+    x_lowrank = model.Mixed_6b(x_lowrank)
+    x_lowrank = model.Mixed_6c(x_lowrank)
+    x_lowrank = model.Mixed_6d(x_lowrank)
+    x_lowrank = model.Mixed_6e(x_lowrank)
 
     B, C, H, W = x_lowrank.size()
+    target_rank, num_nonzeros = calculate_lrs_parameters(C, H * W, compression_rate_deep, rank_ratio_deep)
+    feat_lowrank = x_lowrank.view(B, C, H * W).float()
+    D_lowrank = torch.clamp(torch.sqrt(torch.sum(feat_lowrank * feat_lowrank, dim=-1, keepdim=True)), min=1e-8)
+    normalized_feat_lowrank = feat_lowrank / D_lowrank
 
-    d_out = C
-    d_in = H * W
+    low_rank_comp, _ = altern_ls(normalized_feat_lowrank, num_iters, target_rank=target_rank, num_nonzeros=num_nonzeros)
+    # 1. Lấy tần số từ FEATURE ĐÃ CHUẨN HÓA
+    normalized_spatial_lowrank = normalized_feat_lowrank.view(B, C, H, W)
+    freq_comp_d = keep_frequency(normalized_spatial_lowrank, "LF")
 
-    target_rank, num_nonzeros = calculate_lrs_parameters(
-        d_out,
-        d_in,
-        compression_rate_deep,
-        rank_ratio_deep
-    )
+    # 2. Cộng tần số vào Low-rank component
+    R_d = low_rank_comp.view(B, C, H, W) + gamma_deep * freq_comp_d
 
-    feat_lowrank = x_lowrank.view(
-        B,
-        C,
-        H * W
-    ).float()
+    # 3. Rescale back SAU KHI đã cộng tần số
+    x_lowrank_new = R_d * D_lowrank.view(B, C, 1, 1)
+    
+    #CODE TRƯỚC SỬA
+    # x_lowrank_lrs = (low_rank_comp * D_lowrank).view(B, C, H, W)
+    # x_lowrank_freq = keep_frequency(x_lowrank, "LF")
+    # # LRS-F Deep: Low-rank + gamma_d * LF
+    # x_lowrank_new = x_lowrank_lrs + gamma_deep * x_lowrank_freq
 
-    D_lowrank = torch.sqrt(
-        torch.sum(
-            feat_lowrank * feat_lowrank,
-            dim=-1,
-            keepdim=True
-        )
-    )
-
-    D_lowrank = torch.clamp(
-        D_lowrank,
-        min=1e-8
-    )
-
-    normalized_feat_lowrank = (
-        feat_lowrank / D_lowrank
-    )
-
-    low_rank_comp, _ = altern_ls(
-        normalized_feat_lowrank,
-        num_iters,
-        target_rank=target_rank,
-        num_nonzeros=num_nonzeros
-    )
-
-    low_rank_comp = (
-        low_rank_comp * D_lowrank
-    )
-
-    x_lowrank_lrs = low_rank_comp.view(
-        B,
-        C,
-        H,
-        W
-    )
-
-    # Frequency component from ORIGINAL deep feature
-    x_lowrank_freq = keep_frequency(
-        x_lowrank,
-        "LF"
-    )
-
-    # LRS-F deep:
-    # Low-rank + Low Frequency
-    x_lowrank_new = (
-        x_lowrank_lrs +
-        x_lowrank_freq
-    )
-
-    logit_lowrank = inv3_logit(
-        model,
-        x_lowrank_new
-    )
+    logit_lowrank = inv3_logit(model, x_lowrank_new)
 
     # ========================================================
     # ORIGINAL BRANCH
-    #
-    # Exactly same as original LRS
     # ========================================================
-
     x_ori = model.Conv2d_1a_3x3(input)
     x_ori = model.Conv2d_2a_3x3(x_ori)
     x_ori = model.Conv2d_2b_3x3(x_ori)
-    x_ori = F.max_pool2d(
-        x_ori,
-        kernel_size=3,
-        stride=2
-    )
+    x_ori = F.max_pool2d(x_ori, kernel_size=3, stride=2)
     x_ori = model.Conv2d_3b_1x1(x_ori)
     x_ori = model.Conv2d_4a_3x3(x_ori)
-    x_ori = F.max_pool2d(
-        x_ori,
-        kernel_size=3,
-        stride=2
-    )
+    x_ori = F.max_pool2d(x_ori, kernel_size=3, stride=2)
     x_ori = model.Mixed_5b(x_ori)
     x_ori = model.Mixed_5c(x_ori)
     x_ori = model.Mixed_5d(x_ori)
@@ -668,22 +362,9 @@ def multi_lrsf_inv3(
     x_ori = model.Mixed_6c(x_ori)
     x_ori = model.Mixed_6d(x_ori)
     x_ori = model.Mixed_6e(x_ori)
+    logit_ori = inv3_logit(model, x_ori)
 
-    logit_ori = inv3_logit(
-        model,
-        x_ori
-    )
-
-    # ========================================================
-    # Four-expert fusion
-    # ========================================================
-
-    return (
-        logit_sparse +
-        logit_balanced +
-        logit_lowrank +
-        logit_ori
-    ) / 4.0
+    return (logit_sparse + logit_balanced + logit_lowrank + logit_ori) / 4.0
 
 
 def calculate_lrs_parameters(d_out, d_in, compression_rate, rank_ratio):

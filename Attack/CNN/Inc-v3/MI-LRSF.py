@@ -1,3 +1,12 @@
+# NOTE:
+# This driver matches the proposed feature-level LRS-F flow.
+# It requires function/LRS.py to provide:
+#     multi_lrsf_featurefusion_inv3(...)
+# which must perform low-rank/sparse decomposition, DCT band extraction,
+# depth-aware feature fusion, inverse rescaling, expert forwarding, and
+# logit fusion. The original MI-LRSF.py only supplied an auxiliary
+# frequency loss and therefore did not implement the proposed flow.
+
 import os
 import sys
 # import csv
@@ -43,417 +52,12 @@ if PROJECT_ROOT not in sys.path:
 
 from function.loader import ImageNet
 from function.Normalize import Normalize
-from function.LRS import multi_lrsf_inv3
+from function.LRS import multi_lrsf_featurefusion_inv3
 
-
-# ============================================================
-# Dataset
-# ============================================================
-
-# class ImageNetDataset(Dataset):
-
-#     def __init__(
-#         self,
-#         input_dir,
-#         input_csv,
-#         image_size=299
-#     ):
-
-#         self.input_dir = input_dir
-#         self.image_size = image_size
-
-#         self.transform = T.Compose([
-#             T.Resize(
-#                 (
-#                     image_size,
-#                     image_size
-#                 )
-#             ),
-#             T.ToTensor()
-#         ])
-
-#         self.samples = []
-
-#         with open(
-#             input_csv,
-#             "r"
-#         ) as f:
-
-#             reader = csv.reader(f)
-
-#             for row in reader:
-
-#                 if len(row) == 0:
-#                     continue
-
-#                 image_id = row[0].strip()
-
-#                 # Skip CSV header
-#                 if image_id.lower() in [
-#                     "imageid",
-#                     "filename",
-#                     "image",
-#                     "path"
-#                 ]:
-#                     continue
-
-#                 candidates = [
-#                     image_id,
-#                     image_id + ".png",
-#                     image_id + ".jpg",
-#                     image_id + ".jpeg",
-#                     image_id + ".JPEG",
-#                     image_id + ".PNG"
-#                 ]
-
-#                 path = None
-
-#                 for candidate in candidates:
-
-#                     candidate_path = os.path.join(
-#                         input_dir,
-#                         candidate
-#                     )
-
-#                     if os.path.exists(
-#                         candidate_path
-#                     ):
-
-#                         path = candidate_path
-#                         break
-
-#                 if path is None:
-
-#                     print(
-#                         "WARNING: missing:",
-#                         image_id
-#                     )
-
-#                     continue
-
-#                 if len(row) < 2:
-#                     raise ValueError(
-#                         f"Missing label for image: {image_id}"
-#                     )
-
-#                 label = int(
-#                     row[1]
-#                 )
-
-#                 self.samples.append(
-#                     (
-#                         path,
-#                         image_id,
-#                         label
-#                     )
-#                 )
-
-#     def __len__(self):
-
-#         return len(
-#             self.samples
-#         )
-
-#     def __getitem__(
-#         self,
-#         idx
-#     ):
-
-#         path, image_id, label = (
-#             self.samples[idx]
-#         )
-
-#         img = Image.open(
-#             path
-#         ).convert(
-#             "RGB"
-#         )
-
-#         img = self.transform(
-#             img
-#         )
-
-#         return (
-#             img,
-#             image_id,
-#             label
-#         )
-
+   
 
 # ============================================================
-# MI-FGSM + LRS-F
-# ============================================================
-
-# ============================================================
-# Frequency branch
-# ============================================================
-
-def build_dct_matrix(n, device, dtype):
-    """Orthogonal DCT-II matrix."""
-    k = torch.arange(n, device=device, dtype=dtype).view(-1, 1)
-    i = torch.arange(n, device=device, dtype=dtype).view(1, -1)
-
-    matrix = torch.cos(
-        torch.pi / n * (i + 0.5) * k
-    )
-
-    matrix[0] *= 1.0 / np.sqrt(n)
-    if n > 1:
-        matrix[1:] *= np.sqrt(2.0 / n)
-
-    return matrix
-
-
-def dct2(x):
-    """
-    Differentiable 2-D orthogonal DCT-II over the last two dimensions.
-    Input:  [B, C, H, W]
-    Output: [B, C, H, W]
-    """
-    h, w = x.shape[-2:]
-
-    dct_h = build_dct_matrix(
-        h,
-        x.device,
-        x.dtype
-    )
-
-    dct_w = build_dct_matrix(
-        w,
-        x.device,
-        x.dtype
-    )
-
-    y = torch.matmul(
-        dct_h,
-        x
-    )
-
-    y = torch.matmul(
-        y,
-        dct_w.t()
-    )
-
-    return y
-
-
-def make_frequency_masks(h, w, lf_threshold, mf_threshold, device, dtype):
-    """
-    Config B:
-        LF <= 0.20
-        MF > 0.20 and <= 0.50
-        HF > 0.50
-
-    The radial frequency is normalized to [0, 1].
-    """
-    u = torch.arange(
-        h,
-        device=device,
-        dtype=dtype
-    ).view(-1, 1)
-
-    v = torch.arange(
-        w,
-        device=device,
-        dtype=dtype
-    ).view(1, -1)
-
-    u = u / max(h - 1, 1)
-    v = v / max(w - 1, 1)
-
-    radius = torch.sqrt(
-        u * u + v * v
-    ) / np.sqrt(2.0)
-
-    lf = radius <= lf_threshold
-    mf = (radius > lf_threshold) & (radius <= mf_threshold)
-    hf = radius > mf_threshold
-
-    return (
-        lf.unsqueeze(0).unsqueeze(0).to(dtype),
-        mf.unsqueeze(0).unsqueeze(0).to(dtype),
-        hf.unsqueeze(0).unsqueeze(0).to(dtype)
-    )
-
-
-def frequency_band_loss(
-    feature_delta,
-    band_mask
-):
-    """
-    Energy of the perturbation in one DCT frequency band.
-
-    We normalize by the total DCT energy so that feature maps with
-    different channel/spatial sizes contribute on a comparable scale.
-    """
-    coeff = dct2(feature_delta)
-
-    band_energy = torch.sum(
-        (coeff * band_mask) ** 2,
-        dim=(1, 2, 3)
-    )
-
-    total_energy = torch.sum(
-        coeff ** 2,
-        dim=(1, 2, 3)
-    )
-
-    ratio = band_energy / (
-        total_energy + 1e-12
-    )
-
-    return ratio.mean()
-
-
-def extract_inv3_frequency_features(
-    model,
-    normalized_input
-):
-    """
-    Extract the three Inception-v3 feature locations used by Step 3/4:
-
-        shallow  -> Mixed_5b  (35 x 35)
-        balanced -> Mixed_5d  (35 x 35)
-        deep     -> Mixed_6e  (17 x 17)
-
-    This follows the original Inception-v3 forward path and does not
-    apply LRS decomposition. The frequency branch therefore measures
-    how the adversarial perturbation changes the original feature
-    representation at the selected depths.
-    """
-    x = model.Conv2d_1a_3x3(normalized_input)
-    x = model.Conv2d_2a_3x3(x)
-    x = model.Conv2d_2b_3x3(x)
-    x = F.max_pool2d(
-        x,
-        kernel_size=3,
-        stride=2
-    )
-    x = model.Conv2d_3b_1x1(x)
-    x = model.Conv2d_4a_3x3(x)
-    x = F.max_pool2d(
-        x,
-        kernel_size=3,
-        stride=2
-    )
-
-    shallow = model.Mixed_5b(x)
-
-    x = model.Mixed_5c(shallow)
-    balanced = model.Mixed_5d(x)
-
-    x = model.Mixed_6a(balanced)
-    x = model.Mixed_6b(x)
-    x = model.Mixed_6c(x)
-    x = model.Mixed_6d(x)
-    deep = model.Mixed_6e(x)
-
-    return shallow, balanced, deep
-
-
-def frequency_objective(
-    adv_features,
-    orig_features,
-    schedule="lrsf",
-    lf_threshold=0.20,
-    mf_threshold=0.50
-):
-    """
-    Step-8 frequency ablation schedules.
-
-    The table is encoded as: 
-        LRS-F          : shallow H, middle M, deep L
-        LRS + H only   : shallow H, middle none, deep none
-        LRS + M only   : shallow none, middle M, deep none
-        LRS + L only   : shallow none, middle none, deep L
-        Wrong schedule : shallow L, middle M, deep H
-
-    Each selected band contributes the normalized DCT energy ratio of
-    the adversarial feature perturbation at that depth. Unselected
-    depths contribute zero.
-    """
-    adv_shallow, adv_balanced, adv_deep = adv_features
-    orig_shallow, orig_balanced, orig_deep = orig_features
-
-    masks_shallow = make_frequency_masks(
-        adv_shallow.shape[-2], adv_shallow.shape[-1],
-        lf_threshold, mf_threshold, adv_shallow.device, adv_shallow.dtype
-    )
-    masks_balanced = make_frequency_masks(
-        adv_balanced.shape[-2], adv_balanced.shape[-1],
-        lf_threshold, mf_threshold, adv_balanced.device, adv_balanced.dtype
-    )
-    masks_deep = make_frequency_masks(
-        adv_deep.shape[-2], adv_deep.shape[-1],
-        lf_threshold, mf_threshold, adv_deep.device, adv_deep.dtype
-    )
-
-    delta_shallow = adv_shallow - orig_shallow
-    delta_balanced = adv_balanced - orig_balanced
-    delta_deep = adv_deep - orig_deep
-
-    schedule = schedule.lower().strip()
-    schedule_map = {
-        "lrsf": ("h", "m", "l"),
-        "lrs+h": ("h", None, None),
-        "lrs_h": ("h", None, None),
-        "h": ("h", None, None),
-        "lrs+m": (None, "m", None),
-        "lrs_m": (None, "m", None),
-        "m": (None, "m", None),
-        "lrs+l": (None, None, "l"),
-        "lrs_l": (None, None, "l"),
-        "l": (None, None, "l"),
-        "wrong": ("l", "m", "h"),
-        "wrong_schedule": ("l", "m", "h"),
-    }
-
-    if schedule not in schedule_map:
-        raise ValueError(
-            f"Unknown frequency schedule: {schedule}. "
-            "Use lrsf, lrs_h, lrs_m, lrs_l, or wrong_schedule."
-        )
-
-    selected = schedule_map[schedule]
-    mask_lookup = {
-        "l": 0,
-        "m": 1,
-        "h": 2,
-    }
-
-    losses = []
-    active = 0
-
-    deltas = [
-        delta_shallow,
-        delta_balanced,
-        delta_deep
-    ]
-    masks = [
-        masks_shallow,
-        masks_balanced,
-        masks_deep
-    ]
-
-    for delta, depth_masks, band in zip(deltas, masks, selected):
-        if band is None:
-            continue
-        losses.append(
-            frequency_band_loss(
-                delta,
-                depth_masks[mask_lookup[band]]
-            )
-        )
-        active += 1
-
-    if active == 0:
-        return adv_shallow.sum() * 0.0
-
-    return sum(losses) / float(active)
-
-
-# ============================================================
-# MI-FGSM + LRS-F + Frequency
+# MI-FGSM + Proposed LRS-F (feature-level frequency fusion)
 # ============================================================
 
 def attack(
@@ -473,7 +77,9 @@ def attack(
     rank_ratio_deep=0.1,
     lf_threshold=0.20,
     mf_threshold=0.50,
-    frequency_weight=1.0,
+    gamma_shallow=1.0,
+    gamma_middle=1.0,
+    gamma_deep=1.0,
     frequency_schedule="lrsf"
 ):
 
@@ -485,25 +91,8 @@ def attack(
         adv
     )
 
-    # --------------------------------------------------------
-    # Original feature representation.
-    #
-    # These features are detached because the frequency branch
-    # measures the change caused by the adversarial image.
-    # --------------------------------------------------------
-
-    with torch.no_grad():
-        normalized_orig = normalize(x)
-
-        orig_features = extract_inv3_frequency_features(
-            model,
-            normalized_orig
-        )
-
-        orig_features = tuple(
-            feat.detach()
-            for feat in orig_features
-        )
+    # Frequency is fused inside the hierarchical experts; no clean-feature
+    # reference branch is needed in this driver.
 
     for _ in range(num_iter):
 
@@ -512,10 +101,21 @@ def attack(
         normalized_adv = normalize(adv)
 
         # ----------------------------------------------------
-        # LRS-F surrogate
+        # Proposed LRS-F: feature-level frequency fusion
+        #
+        # Expected behavior inside multi_lrsf_featurefusion_inv3:
+        #   shallow: R_s = S_s + gamma_shallow * F_s^high
+        #   middle : R_m = L_m + S_m + gamma_middle * F_m^mid
+        #   deep   : R_d = L_d + gamma_deep * F_d^low
+        #
+        # Then inverse-rescale each R_l, forward the remaining
+        # layers, fuse original/shallow/middle/deep logits, and
+        # return the fused logits. No auxiliary frequency loss is
+        # used in this driver; frequency affects the attack through
+        # the expert representations themselves.
         # ----------------------------------------------------
 
-        logits = multi_lrsf_inv3(
+        logits = multi_lrsf_featurefusion_inv3(
             model,
             normalized_adv,
 
@@ -539,50 +139,19 @@ def attack(
             rank_ratio_deep=
                 rank_ratio_deep,
 
-            lf_threshold=
-                lf_threshold,
+            lf_threshold=lf_threshold,
+            mf_threshold=mf_threshold,
 
-            mf_threshold=
-                mf_threshold
+            gamma_shallow=gamma_shallow,
+            gamma_middle=gamma_middle,
+            gamma_deep=gamma_deep,
+
+            frequency_schedule=frequency_schedule
         )
 
-        ce_loss = F.cross_entropy(
+        loss = F.cross_entropy(
             logits,
             labels
-        )
-
-        # ----------------------------------------------------
-        # Frequency branch
-        #
-        # Extract original-path Inception features and measure
-        # normalized DCT energy of the feature perturbation:
-        #
-        #   shallow  -> HF
-        #   balanced -> MF
-        #   deep     -> LF
-        #
-        # Maximizing this term encourages the adversarial feature
-        # change to occupy the selected frequency bands.
-        # ----------------------------------------------------
-
-        adv_features = extract_inv3_frequency_features(
-            model,
-            normalized_adv
-        )
-
-        freq_loss = frequency_objective(
-            adv_features,
-            orig_features,
-            schedule=frequency_schedule,
-            lf_threshold=lf_threshold,
-            mf_threshold=mf_threshold
-        )
-
-        # Both CE and frequency objective are maximized by the
-        # untargeted MI-FGSM ascent step.
-        loss = (
-            ce_loss
-            + frequency_weight * freq_loss
         )
 
         grad = torch.autograd.grad(
@@ -709,235 +278,50 @@ def save_images(
 def main():
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--input_csv", type=str, default=os.path.join(PROJECT_ROOT,"dataset/test10.csv"))
+    parser.add_argument("--input_dir", type=str, default=os.path.join(PROJECT_ROOT,"dataset/images"))
+    parser.add_argument("--output_dir",type=str, default=os.path.join(PROJECT_ROOT,"Attack/outputs/incv3-Step8-ablation"))
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
 
-    # --------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------
-
-    parser.add_argument(
-
-        "--input_csv",
-
-        type=str,
-
-        default=os.path.join(
-            PROJECT_ROOT,
-            "dataset/test10.csv"
-        )
-    )
-
-    parser.add_argument(
-
-        "--input_dir",
-
-        type=str,
-
-        default=os.path.join(
-            PROJECT_ROOT,
-            "dataset/images"
-        )
-    )
-
-    parser.add_argument(
-
-        "--output_dir",
-
-        type=str,
-
-        default=os.path.join(
-            PROJECT_ROOT,
-            "Attack/outputs/incv3-Step8-ablation"
-        )
-    )
-
-    parser.add_argument(
-
-        "--batch_size",
-
-        type=int,
-
-        default=1
-    )
-
-    parser.add_argument(
-
-        "--num_workers",
-
-        type=int,
-
-        default=0
-    )
-
-    # --------------------------------------------------------
+   
     # MI-FGSM
-    # --------------------------------------------------------
+    parser.add_argument("--max_epsilon", type=float, default=16.0)
+    parser.add_argument("--num_iter", type=int, default=10)
+    parser.add_argument( "--momentum", type=float, default=1.0)
 
-    parser.add_argument(
-
-        "--max_epsilon",
-
-        type=float,
-
-        default=16.0
-    )
-
-    parser.add_argument(
-
-        "--num_iter",
-
-        type=int,
-
-        default=10
-    )
-
-    parser.add_argument(
-
-        "--momentum",
-
-        type=float,
-
-        default=1.0
-    )
-
-    # --------------------------------------------------------
     # LRS decomposition
-    # --------------------------------------------------------
-
-    parser.add_argument(
-
-        "--lrs_num_iters",
-
-        type=int,
-
-        default=5
-    )
-
-    parser.add_argument(
-
-        "--compression_rate_shallow",
-
-        type=float,
-
-        default=0.8
-    )
-
-    parser.add_argument(
-
-        "--rank_ratio_shallow",
-
-        type=float,
-
-        default=0.01
-    )
-
-    parser.add_argument(
-
-        "--compression_rate_balanced",
-
-        type=float,
-
-        default=0.5
-    )
-
-    parser.add_argument(
-
-        "--rank_ratio_balanced",
-
-        type=float,
-
-        default=0.04
-    )
-
-    parser.add_argument(
-
-        "--compression_rate_deep",
-
-        type=float,
-
-        default=0.0
-    )
-
-    parser.add_argument(
-
-        "--rank_ratio_deep",
-
-        type=float,
-
-        default=0.1
-    )
+    parser.add_argument( "--lrs_num_iters", type=int, default=5)
+    parser.add_argument( "--compression_rate_shallow", type=float, default=0.8)
+    parser.add_argument( "--rank_ratio_shallow", type=float, default=0.01)
+    parser.add_argument( "--compression_rate_balanced", type=float, default=0.5)
+    parser.add_argument( "--rank_ratio_balanced", type=float, default=0.04)
+    parser.add_argument( "--compression_rate_deep", type=float, default=0.0)
+    parser.add_argument( "--rank_ratio_deep", type=float, default=0.1)
 
     # --------------------------------------------------------
     # Frequency partition
     # --------------------------------------------------------
 
-    parser.add_argument(
-
-        "--lf_threshold",
-
-        type=float,
-
-        default=0.20
-    )
-
-    parser.add_argument(
-
-        "--mf_threshold",
-
-        type=float,
-
-        default=0.50
-    )
-
-    parser.add_argument(
-
-        "--frequency_weight",
-
-        type=float,
-
-        default=1.0
-    )
-
-    parser.add_argument(
-
-        "--frequency_schedule",
-
-        type=str,
-
-        default="lrsf",
-
-        choices=[
+    parser.add_argument( "--lf_threshold", type=float, default=0.20)
+    parser.add_argument( "--mf_threshold", type=float, default=0.50)
+    parser.add_argument( "--gamma_shallow", type=float, default=1.0)
+    parser.add_argument( "--gamma_middle", type=float, default=1.0)
+    parser.add_argument( "--gamma_deep", type=float, default=1.0)
+    parser.add_argument( "--frequency_schedule", type=str, default="lrsf", choices=[
             "lrsf",
             "lrs_h",
             "lrs_m",
             "lrs_l",
             "wrong_schedule"
-        ]
-    )
-
-    parser.add_argument(
-
-        "--optimizer",
-
-        type=str,
-
-        default="mi",
-
-        choices=["mi", "ifgsm"]
-    )
+        ])
+    parser.add_argument( "--optimizer", type=str, default="mi", choices=["mi", "ifgsm"])
 
     # --------------------------------------------------------
     # Reproducibility
     # --------------------------------------------------------
 
-    parser.add_argument(
-
-        "--seed",
-
-        type=int,
-
-        default=123
-    )
-
+    parser.add_argument( "--seed", type=int, default=123)
     opt = parser.parse_args()
 
     # ========================================================
@@ -1020,7 +404,8 @@ def main():
     )
 
     print(
-        f"Frequency objective weight: {opt.frequency_weight}"
+        f"Feature-frequency gammas: shallow={opt.gamma_shallow}, "
+        f"middle={opt.gamma_middle}, deep={opt.gamma_deep}"
     )
 
     print(
@@ -1232,8 +617,14 @@ def main():
             mf_threshold=
                 opt.mf_threshold,
 
-            frequency_weight=
-                opt.frequency_weight,
+            gamma_shallow=
+                opt.gamma_shallow,
+
+            gamma_middle=
+                opt.gamma_middle,
+
+            gamma_deep=
+                opt.gamma_deep,
 
             frequency_schedule=
                 opt.frequency_schedule
